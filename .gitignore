@@ -1,0 +1,21 @@
+# 忽略
+build/
+*.bin
+*.elf
+*.map
+*.log
+*.tmp
+
+# 系统
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 本地密钥（如果拆分了配置）
+secrets.h
+config.local.h
+
+# 抓图（预览图除外）
+*.jpg
+*.png
+!docs/preview.jpg
