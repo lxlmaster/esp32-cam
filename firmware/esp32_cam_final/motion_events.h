@@ -1,5 +1,6 @@
 #pragma once
 #include <Arduino.h>
+#include "camera_role.h"
 
 // Optional secrets/settings in ignored config.local.h; see config.example.h.
 #if __has_include("config.local.h")

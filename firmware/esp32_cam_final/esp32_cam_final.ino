@@ -39,12 +39,13 @@
 #include "freertos/semphr.h"
 #include "motion_detector.h"
 #include "motion_events.h"
+#include "web_ui.h"
 
 /* ==================== 配置 ==================== */
-const char *WIFI_SSID = "1001";
-const char *WIFI_PASS = "YOUR_WIFI_PASSWORD";
-const char *AUTH_USER = "cam";
-const char *AUTH_PASS = "YOUR_CAM_PASSWORD";
+const char *WIFI_SSID = CAMERA_WIFI_SSID;
+const char *WIFI_PASS = CAMERA_WIFI_PASSWORD;
+const char *AUTH_USER = CAMERA_AUTH_USER;
+const char *AUTH_PASS = CAMERA_AUTH_PASSWORD;
 
 /* ---------- 引脚（官方 ESP32S3-EYE） ---------- */
 #define PWDN_GPIO_NUM   -1
@@ -67,7 +68,7 @@ const char *AUTH_PASS = "YOUR_CAM_PASSWORD";
 #define XCLK_FREQ       15000000
 
 /* ---------- 运行参数 ---------- */
-static framesize_t g_fs      = FRAMESIZE_CIF;   /* 400x296：实测 124ms / 8fps，画质与流畅的平衡点 */
+static framesize_t g_fs = CAMERA_ROLE == CAMERA_ROLE_DETECTOR ? FRAMESIZE_QVGA : FRAMESIZE_CIF;   /* 400x296：实测 124ms / 8fps，画质与流畅的平衡点 */
 static int         g_quality = 75; // software JPEG: 1..100, higher = better
 static bool        g_inited  = false;
 
@@ -123,6 +124,10 @@ static SemaphoreHandle_t g_bufLock = NULL;
 static volatile bool    g_camRun   = false;
 static volatile uint32_t g_frameCount = 0;
 static volatile uint32_t g_lastCostMs = 0;
+static volatile uint32_t g_encodedCount = 0;
+static uint32_t g_previewRequestedAt = 0;
+static bool g_previewRequested = false;
+static SemaphoreHandle_t g_previewLock = nullptr;
 
 static httpd_handle_t g_server = NULL;
 static httpd_handle_t g_streamServer = NULL;
@@ -131,7 +136,7 @@ static uint8_t *g_encodeBuf = nullptr, *g_snapBuf = nullptr, *g_streamBuf = null
 static SemaphoreHandle_t g_cameraLock = nullptr;
 static MotionConfig motionConfig() {
   MotionConfig config;
-  config.enabled = MOTION_ENABLED;
+  config.enabled = cameraDetectionEnabled(MOTION_ENABLED);
   return config;
 }
 static MotionDetector g_detector(motionConfig());
@@ -256,6 +261,20 @@ static size_t writeJpeg(void *arg, size_t index, const void *data, size_t len) {
   return len;
 }
 
+static void requestPreview() {
+  xSemaphoreTake(g_previewLock, portMAX_DELAY);
+  g_previewRequestedAt = millis();
+  g_previewRequested = true;
+  xSemaphoreGive(g_previewLock);
+}
+
+static bool previewActive(uint32_t now) {
+  xSemaphoreTake(g_previewLock, portMAX_DELAY);
+  bool active = cameraPreviewActive(now, g_previewRequestedAt, g_previewRequested);
+  xSemaphoreGive(g_previewLock);
+  return active;
+}
+
 static void camTask(void *) {
   while (true) {
     // Reconfiguration and sensor writes cannot race a live frame/encoder.
@@ -274,6 +293,13 @@ static void camTask(void *) {
     bool motion = fb->format == PIXFORMAT_RGB565 &&
       g_detector.update(fb->buf, fb->len, fb->width, fb->height, capturedAt);
     uint8_t score = g_detector.score();
+    if (!cameraShouldEncode(motion, previewActive(capturedAt))) {
+      // Dedicated detector: release raw frames without spending CPU on JPEG.
+      esp_camera_fb_return(fb);
+      xSemaphoreGive(g_cameraLock);
+      vTaskDelay(pdMS_TO_TICKS(20));
+      continue;
+    }
     if (fb->format == PIXFORMAT_RGB565) {
       size_t bytes = size_t(fb->width) * fb->height * 2;
       if (bytes <= fb->len) applyColorFix(fb->buf, bytes);
@@ -289,6 +315,7 @@ static void camTask(void *) {
       g_jpgBuf = g_encodeBuf; g_encodeBuf = old;
       g_jpgLen = writer.len;
       ++g_frameCount;
+      ++g_encodedCount;
       g_lastCostMs = (esp_timer_get_time() - t0) / 1000;
       xSemaphoreGive(g_bufLock);
     }
@@ -315,6 +342,7 @@ static bool fetchJpeg(uint8_t *out, size_t *outLen, uint32_t *seq) {
 static esp_err_t snapHandler(httpd_req_t *req) {
   if (!checkAuth(req)) { sendAuthRequired(req); return ESP_OK; }
 
+  requestPreview();
   size_t len = 0;
   uint32_t seq = 0;
   char val[24];
@@ -350,6 +378,7 @@ static esp_err_t streamHandler(httpd_req_t *req) {
   uint32_t lastSeq = 0;
 
   while (true) {
+    requestPreview();
     /* 等新帧，避免同一帧重复发 */
     uint32_t waited = 0;
     while (g_frameCount == lastSeq && waited < 200) {
@@ -470,13 +499,14 @@ static esp_err_t setHandler(httpd_req_t *req) {
   uint32_t fps10 = 0;
   if (g_lastCostMs > 0) fps10 = 10000 / g_lastCostMs;
 
-  char json[420];
+  char json[512];
   snprintf(json, sizeof(json),
-           "{\"size\":\"%dx%d\",\"quality\":%d,\"compress_ms\":%u,\"fps_x10\":%u,"
+           "{\"role\":\"%s\",\"encoded_frames\":%u,\"size\":\"%dx%d\",\"quality\":%d,\"compress_ms\":%u,\"fps_x10\":%u,"
            "\"frames\":%u,\"free_psram_kb\":%u,"
            "\"rg\":%u,\"gg\":%u,\"bg\":%u,\"cf\":%d,"
            "\"drv_awb\":%d,\"slv_addr\":\"0x%02X\"}\n",
-           w, h, g_quality, g_lastCostMs, fps10,
+           cameraRoleName(), g_encodedCount, w, h, g_quality, g_lastCostMs,
+           CAMERA_ROLE == CAMERA_ROLE_DETECTOR ? 0 : fps10,
            g_frameCount,
            psramFound() ? ESP.getFreePsram() / 1024 : 0,
            g_rGain, g_gGain, g_bGain, g_colorFix ? 1 : 0,
@@ -490,161 +520,8 @@ static esp_err_t setHandler(httpd_req_t *req) {
 
 /* ---------- 播放页 ---------- */
 
-static const char INDEX_HTML[] PROGMEM = R"HTML(
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
-<meta name="theme-color" content="#111111">
-<title>家里</title>
-<style>
-  * { box-sizing: border-box; }
-  html,body { margin:0; height:100%; background:#0d0d0d; overflow:hidden;
-              font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif; }
-  #wrap { position:relative; width:100%; height:100%; display:flex;
-          align-items:center; justify-content:center; }
-  #v { max-width:100%; max-height:100%; display:block; }
-  #hud { position:fixed; left:0; right:0; bottom:0; padding:10px 14px;
-         font-size:12px; line-height:1.6; color:#c8c8c8;
-         background:linear-gradient(transparent,rgba(0,0,0,.78));
-         display:flex; justify-content:space-between; align-items:center; gap:8px; }
-  #dot { display:inline-block; width:7px; height:7px; border-radius:50%;
-         background:#4ade80; margin-right:6px; vertical-align:1px; }
-  #dot.off { background:#ef4444; }
-  .btn { border:1px solid #444; background:#1c1c1c; color:#ddd; border-radius:6px;
-         padding:6px 10px; font-size:12px; margin-left:6px; white-space:nowrap; }
-  .btn:active { background:#333; }
-  #pause { position:absolute; inset:0; display:none; align-items:center;
-           justify-content:center; color:#888; font-size:14px; }
-</style>
-</head>
-<body>
-<div id="wrap">
-  <img id="v" alt="">
-  <div id="pause">已暂停</div>
-</div>
-<div id="hud">
-  <span><span id="dot"></span><span id="stat">连接中…</span></span>
-  <span>
-    <button class="btn" id="btnSize">400x296</button>
-    <button class="btn" id="btn">暂停</button>
-  </span>
-</div>
-<script>
-(function () {
-  var img = document.getElementById('v'),
-      stat = document.getElementById('stat'),
-      dot = document.getElementById('dot'),
-      pauseLayer = document.getElementById('pause'),
-      btn = document.getElementById('btn'),
-      btnSize = document.getElementById('btnSize');
+// UI source: web/index.html; generated by tools/embed_web.py.
 
-  var running = true, frames = 0, t0 = 0, fail = 0, sequence = 0, objectUrl = null, loading = false, requestStarted = 0;
-  var realFps = 0, realSize = '';
-  var sizes  = ['qvga','cif','hvga','vga','svga'];
-  var labels = ['320x240','400x296','480x320','640x480','800x600'];
-  var si = 1;
-
-  function next() {
-    if (!running || loading) return;
-    loading = true;
-    requestStarted = Date.now();
-    fetch('/snap?after=' + sequence, {credentials:'include', cache:'no-store'})
-      .then(function(r) {
-        if (r.status === 204) { loading = false; setTimeout(next, 40); return null; }
-        if (!r.ok) throw new Error('HTTP ' + r.status);
-        sequence = Number(r.headers.get('X-Frame-Id')) || 0;
-        return r.blob();
-      }).then(function(blob) {
-        if (!blob) return;
-        if (objectUrl) URL.revokeObjectURL(objectUrl);
-        objectUrl = URL.createObjectURL(blob);
-        img.src = objectUrl;
-      }).catch(function() { img.onerror(); });
-  }
-
-  /* 每 2 秒问一次板子的真实帧率（页面拉取频率不代表画面更新频率） */
-  setInterval(function () {
-    fetch('/set', { credentials: 'include' })
-      .then(function (r) { return r.json(); })
-      .then(function (j) { realFps = j.fps_x10 / 10; realSize = j.size; })
-      .catch(function () {});
-  }, 2000);
-
-  img.onload = function () {
-    loading = false;
-    fail = 0; frames++;
-    if (!t0) t0 = Date.now();
-    var sec = (Date.now() - t0) / 1000;
-    if (sec > 0.5) {
-      dot.className = '';
-      var pull = (frames / sec).toFixed(1);
-      if (realFps > 0) {
-        stat.textContent = realFps.toFixed(1) + ' fps · ' + realSize +
-                           ' (拉取 ' + pull + ')';
-      } else {
-        stat.textContent = pull + ' fps · ' +
-                           img.naturalWidth + ' x ' + img.naturalHeight;
-      }
-    }
-    var interval = realFps > 0 ? Math.max(40, 1000 / realFps) : 100;
-    setTimeout(next, Math.max(0, interval - (Date.now() - requestStarted)));
-  };
-
-  img.onerror = function () {
-    loading = false;
-    fail++;
-    dot.className = 'off';
-    stat.textContent = fail > 4 ? '信号中断，重试中' : '重连中...';
-    setTimeout(next, Math.min(600 + fail * 300, 3000));
-  };
-
-  btnSize.onclick = function () {
-    si = (si + 1) % sizes.length;
-    stat.textContent = '切换中…';
-    running = false;
-    fetch('/set?size=' + sizes[si], { credentials: 'include' })
-      .then(function () { return fetch('/set'); })
-      .then(function (r) { return r.json(); })
-      .then(function (j) {
-        btnSize.textContent = j.size;
-        running = true; frames = 0; t0 = 0; fail = 0;
-        setTimeout(next, 400);
-      })
-      .catch(function () { running = true; next(); });
-  };
-
-  btn.onclick = function () {
-    if (running) {
-      running = false;
-      pauseLayer.style.display = 'flex';
-      btn.textContent = '继续';
-      dot.className = 'off';
-      stat.textContent = '已暂停';
-    } else {
-      running = true; frames = 0; t0 = 0; fail = 0;
-      pauseLayer.style.display = 'none';
-      btn.textContent = '暂停';
-      next();
-    }
-  };
-
-  document.addEventListener('visibilitychange', function () {
-    if (document.hidden) {
-      running = false;
-      btn.textContent = '继续';
-      pauseLayer.style.display = 'flex';
-      stat.textContent = '后台已暂停';
-    }
-  });
-
-  next();
-})();
-</script>
-</body>
-</html>
-)HTML";
 
 static esp_err_t indexHandler(httpd_req_t *req) {
   if (!checkAuth(req)) { sendAuthRequired(req); return ESP_OK; }
@@ -717,7 +594,8 @@ static void connectWiFi() {
   Serial.printf("[WiFi] 连接 \"%s\"\n", WIFI_SSID);
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
-  WiFi.setHostname("esp32-cam");
+  WiFi.setHostname(CAMERA_ROLE == CAMERA_ROLE_DETECTOR ? "esp32-detector" :
+                   CAMERA_ROLE == CAMERA_ROLE_STREAM ? "esp32-stream" : "esp32-cam");
   WiFi.begin(WIFI_SSID, WIFI_PASS);
 
   unsigned long start = millis();
@@ -756,7 +634,8 @@ void setup() {
   }
   g_bufLock = xSemaphoreCreateMutex();
   g_cameraLock = xSemaphoreCreateMutex();
-  if (!g_bufLock || !g_cameraLock || !motionEventsBegin()) {
+  g_previewLock = xSemaphoreCreateMutex();
+  if (!g_bufLock || !g_cameraLock || !g_previewLock || !motionEventsBegin()) {
     Serial.println("[SYS] module initialization failed");
     delay(5000); ESP.restart(); return;
   }

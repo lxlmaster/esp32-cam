@@ -113,7 +113,7 @@ void motionEventsStatus(char *json, size_t capacity) {
   snprintf(json, capacity,
     "{\"enabled\":%s,\"webhook_configured\":%s,\"events\":%u,\"last_uptime_ms\":%u,"
     "\"last_score\":%u,\"photo_bytes\":%u,\"sent\":%u,\"failed\":%u,\"dropped\":%u,\"last_http\":%d}",
-    MOTION_ENABLED ? "true" : "false", strlen(MOTION_WEBHOOK_URL) ? "true" : "false",
+    cameraDetectionEnabled(MOTION_ENABLED) ? "true" : "false", strlen(MOTION_WEBHOOK_URL) ? "true" : "false",
     events, lastAt, lastScore, unsigned(photoLen), sent, failed, dropped, lastHttp);
   xSemaphoreGive(lock);
 }

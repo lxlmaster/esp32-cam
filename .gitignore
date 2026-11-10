@@ -15,6 +15,9 @@ desktop.ini
 secrets.h
 config.local.h
 .tools/
+console/config.local.json
+console/data/
+__pycache__/
 
 # 抓图（预览图除外）
 *.jpg

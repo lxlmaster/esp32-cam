@@ -1,0 +1,20 @@
+{
+  "username": "admin",
+  "password": "",
+  "webhook_token": "CHANGE_ME_TO_A_RANDOM_TOKEN",
+  "retain_events": 20,
+  "preview_fps": 5,
+  "status_poll_seconds": 10,
+  "stream": {
+    "name": "实时摄像头",
+    "url": "",
+    "username": "cam",
+    "password": "YOUR_CAM_PASSWORD"
+  },
+  "detector": {
+    "name": "检测摄像头",
+    "url": "",
+    "username": "cam",
+    "password": "YOUR_CAM_PASSWORD"
+  }
+}
