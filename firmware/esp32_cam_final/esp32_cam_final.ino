@@ -17,7 +17,7 @@
  *
  * 调参接口（带 Basic Auth）：
  *   /set?size=qvga|cif|hvga|vga|svga
- *   /set?q=10            JPEG 质量 0-63（越小越清晰越慢）
+ *   /set?q=75            软件 JPEG 质量 1-100（越大越清晰）
  *   /set?wb=0|1          自动白平衡
  *   /set?br=-2..2        亮度
  *   /set?ct=-2..2        对比度
@@ -37,6 +37,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "motion_detector.h"
+#include "motion_events.h"
 
 /* ==================== 配置 ==================== */
 const char *WIFI_SSID = "1001";
@@ -66,7 +68,7 @@ const char *AUTH_PASS = "YOUR_CAM_PASSWORD";
 
 /* ---------- 运行参数 ---------- */
 static framesize_t g_fs      = FRAMESIZE_CIF;   /* 400x296：实测 124ms / 8fps，画质与流畅的平衡点 */
-static int         g_quality = 10;
+static int         g_quality = 75; // software JPEG: 1..100, higher = better
 static bool        g_inited  = false;
 
 /* ---------- 软件色彩校正 ----------
@@ -102,13 +104,15 @@ static void rebuildLUT() {
 
 static inline void applyColorFix(uint8_t *buf, size_t bytes) {
   if (!g_colorFix) return;
-  uint16_t *p = (uint16_t *)buf;
   size_t n = bytes / 2;
   for (size_t i = 0; i < n; i++) {
-    uint16_t v = p[i];
-    p[i] = (uint16_t)((g_rLUT[(v >> 11) & 0x1F] << 11) |
+    // Camera RGB565 is high byte first, matching the software JPEG converter.
+    uint16_t v = (uint16_t(buf[2 * i]) << 8) | buf[2 * i + 1];
+    uint16_t corrected = (uint16_t)((g_rLUT[(v >> 11) & 0x1F] << 11) |
                       (g_gLUT[(v >> 5)  & 0x3F] << 5)  |
                        g_bLUT[ v        & 0x1F]);
+    buf[2 * i] = corrected >> 8;
+    buf[2 * i + 1] = corrected & 0xFF;
   }
 }
 
@@ -121,6 +125,18 @@ static volatile uint32_t g_frameCount = 0;
 static volatile uint32_t g_lastCostMs = 0;
 
 static httpd_handle_t g_server = NULL;
+static httpd_handle_t g_streamServer = NULL;
+static constexpr size_t JPEG_CAPACITY = 256 * 1024;
+static uint8_t *g_encodeBuf = nullptr, *g_snapBuf = nullptr, *g_streamBuf = nullptr;
+static SemaphoreHandle_t g_cameraLock = nullptr;
+static MotionConfig motionConfig() {
+  MotionConfig config;
+  config.enabled = MOTION_ENABLED;
+  return config;
+}
+static MotionDetector g_detector(motionConfig());
+static bool getParam(httpd_req_t *req, const char *key, char *val, size_t valLen);
+
 static char g_authHeader[128];
 
 /* ---------- 认证 ---------- */
@@ -153,8 +169,9 @@ static void sendAuthRequired(httpd_req_t *req) {
 
 static bool startCamera(framesize_t fs, int quality) {
   g_camRun = false;
-  delay(200);
-
+  xSemaphoreTake(g_bufLock, portMAX_DELAY);
+  g_jpgLen = 0;
+  xSemaphoreGive(g_bufLock);
   if (g_inited) {
     esp_camera_deinit();
     g_inited = false;
@@ -181,10 +198,10 @@ static bool startCamera(framesize_t fs, int quality) {
   c.xclk_freq_hz = XCLK_FREQ;
   c.pixel_format = PIXFORMAT_RGB565;
   c.frame_size   = fs;
-  c.jpeg_quality = quality;
+  c.jpeg_quality = 12; // hardware encoder only; unused for RGB565
   c.fb_count     = 2;
   c.fb_location  = CAMERA_FB_IN_PSRAM;
-  c.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
+  c.grab_mode    = CAMERA_GRAB_LATEST;
 
   esp_err_t err = esp_camera_init(&c);
   if (err != ESP_OK) {
@@ -209,6 +226,7 @@ static bool startCamera(framesize_t fs, int quality) {
   }
 
   g_camRun = true;
+  g_detector.reset();
 
   int w = 0, h = 0;
   switch (fs) {
@@ -226,60 +244,69 @@ static bool startCamera(framesize_t fs, int quality) {
 
 /* ---------- 生产者任务：不停抓帧压缩 ---------- */
 
-static void camTask(void *arg) {
-  Serial.println("[TASK] 采集任务启动");
+struct JpegWriter { uint8_t *data; size_t len; bool overflow; };
+static size_t writeJpeg(void *arg, size_t index, const void *data, size_t len) {
+  JpegWriter *writer = static_cast<JpegWriter *>(arg);
+  if (index > JPEG_CAPACITY || len > JPEG_CAPACITY - index) {
+    writer->overflow = true;
+    return 0;
+  }
+  if (len) memcpy(writer->data + index, data, len);
+  if (index + len > writer->len) writer->len = index + len;
+  return len;
+}
+
+static void camTask(void *) {
   while (true) {
-    if (!g_camRun || !g_inited) { vTaskDelay(pdMS_TO_TICKS(20)); continue; }
-
+    // Reconfiguration and sensor writes cannot race a live frame/encoder.
+    xSemaphoreTake(g_cameraLock, portMAX_DELAY);
+    if (!g_camRun || !g_inited) {
+      xSemaphoreGive(g_cameraLock);
+      vTaskDelay(pdMS_TO_TICKS(20)); continue;
+    }
     int64_t t0 = esp_timer_get_time();
-
     camera_fb_t *fb = esp_camera_fb_get();
-    if (!fb) { vTaskDelay(pdMS_TO_TICKS(10)); continue; }
-
-    /* 压缩之前先在原始像素上校色 */
+    if (!fb) {
+      xSemaphoreGive(g_cameraLock);
+      vTaskDelay(pdMS_TO_TICKS(10)); continue;
+    }
+    uint32_t capturedAt = millis();
+    bool motion = fb->format == PIXFORMAT_RGB565 &&
+      g_detector.update(fb->buf, fb->len, fb->width, fb->height, capturedAt);
+    uint8_t score = g_detector.score();
     if (fb->format == PIXFORMAT_RGB565) {
-      size_t pxBytes = (size_t)fb->width * fb->height * 2;
-      if (pxBytes <= fb->len) applyColorFix(fb->buf, pxBytes);
+      size_t bytes = size_t(fb->width) * fb->height * 2;
+      if (bytes <= fb->len) applyColorFix(fb->buf, bytes);
     }
-
-    uint8_t *jpg = NULL;
-    size_t len = 0;
-    bool ok = frame2jpg(fb, g_quality, &jpg, &len);
+    JpegWriter writer = {g_encodeBuf, 0, false};
+    bool ok = frame2jpg_cb(fb, g_quality, writeJpeg, &writer);
     esp_camera_fb_return(fb);
-
-    if (ok && jpg && len > 0 && g_jpgBuf) {
-      if (xSemaphoreTake(g_bufLock, pdMS_TO_TICKS(100)) == pdTRUE) {
-        memcpy(g_jpgBuf, jpg, len);
-        g_jpgLen = len;
-        g_frameCount++;
-        xSemaphoreGive(g_bufLock);
-      }
+    // Publish before releasing camera lock, so restart cannot publish a stale frame.
+    if (ok && !writer.overflow && writer.len) {
+      if (motion) motionEventsCapture(g_encodeBuf, writer.len, score, capturedAt);
+      xSemaphoreTake(g_bufLock, portMAX_DELAY);
+      uint8_t *old = g_jpgBuf;
+      g_jpgBuf = g_encodeBuf; g_encodeBuf = old;
+      g_jpgLen = writer.len;
+      ++g_frameCount;
       g_lastCostMs = (esp_timer_get_time() - t0) / 1000;
+      xSemaphoreGive(g_bufLock);
     }
-    if (jpg) free(jpg);
-
-    /* 让出 CPU，避免把另一个核饿死 */
+    xSemaphoreGive(g_cameraLock);
     vTaskDelay(1);
   }
 }
 
-/* ---------- 取一份当前帧 ---------- */
-
-static bool fetchJpeg(uint8_t **out, size_t *outLen) {
-  if (g_jpgLen == 0 || !g_jpgBuf) return false;
-  uint8_t *copy = (uint8_t *)malloc(g_jpgLen);
-  if (!copy) return false;
-
-  if (xSemaphoreTake(g_bufLock, pdMS_TO_TICKS(200)) != pdTRUE) {
-    free(copy);
+// Copy into a server-owned reusable buffer; length and bytes share one lock.
+static bool fetchJpeg(uint8_t *out, size_t *outLen, uint32_t *seq) {
+  if (xSemaphoreTake(g_bufLock, pdMS_TO_TICKS(200)) != pdTRUE) return false;
+  if (!g_jpgLen || (*seq && *seq == g_frameCount)) {
+    xSemaphoreGive(g_bufLock);
     return false;
   }
-  memcpy(copy, g_jpgBuf, g_jpgLen);
-  size_t n = g_jpgLen;
+  memcpy(out, g_jpgBuf, g_jpgLen);
+  *outLen = g_jpgLen; *seq = g_frameCount;
   xSemaphoreGive(g_bufLock);
-
-  *out = copy;
-  *outLen = n;
   return true;
 }
 
@@ -288,15 +315,21 @@ static bool fetchJpeg(uint8_t **out, size_t *outLen) {
 static esp_err_t snapHandler(httpd_req_t *req) {
   if (!checkAuth(req)) { sendAuthRequired(req); return ESP_OK; }
 
-  uint8_t *jpg = NULL;
   size_t len = 0;
-  if (!fetchJpeg(&jpg, &len)) { httpd_resp_send_500(req); return ESP_FAIL; }
-
+  uint32_t seq = 0;
+  char val[24];
+  if (getParam(req, "after", val, sizeof(val))) seq = strtoul(val, nullptr, 10);
+  if (!fetchJpeg(g_snapBuf, &len, &seq)) {
+    httpd_resp_set_status(req, "204 No Content");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    return httpd_resp_send(req, nullptr, 0);
+  }
+  char sequence[16];
+  snprintf(sequence, sizeof(sequence), "%u", seq);
+  httpd_resp_set_hdr(req, "X-Frame-Id", sequence);
   httpd_resp_set_type(req, "image/jpeg");
   httpd_resp_set_hdr(req, "Cache-Control", "no-store, no-cache");
-  esp_err_t ret = httpd_resp_send(req, (const char *)jpg, len);
-  free(jpg);
-  return ret;
+  return httpd_resp_send(req, (const char *)g_snapBuf, len);
 }
 
 /* ---------- /stream ---------- */
@@ -323,17 +356,16 @@ static esp_err_t streamHandler(httpd_req_t *req) {
       vTaskDelay(pdMS_TO_TICKS(10));
       waited += 10;
     }
-    lastSeq = g_frameCount;
-
-    uint8_t *jpg = NULL;
     size_t len = 0;
-    if (!fetchJpeg(&jpg, &len)) break;
+    if (!fetchJpeg(g_streamBuf, &len, &lastSeq)) {
+      vTaskDelay(pdMS_TO_TICKS(10));
+      continue;
+    }
 
     size_t hlen = snprintf(partBuf, sizeof(partBuf), STREAM_PART, len);
     res = httpd_resp_send_chunk(req, STREAM_BOUNDARY, strlen(STREAM_BOUNDARY));
     if (res == ESP_OK) res = httpd_resp_send_chunk(req, partBuf, hlen);
-    if (res == ESP_OK) res = httpd_resp_send_chunk(req, (const char *)jpg, len);
-    free(jpg);
+    if (res == ESP_OK) res = httpd_resp_send_chunk(req, (const char *)g_streamBuf, len);
     if (res != ESP_OK) break;
   }
   return res;
@@ -350,6 +382,7 @@ static bool getParam(httpd_req_t *req, const char *key, char *val, size_t valLen
 static esp_err_t setHandler(httpd_req_t *req) {
   if (!checkAuth(req)) { sendAuthRequired(req); return ESP_OK; }
 
+  xSemaphoreTake(g_cameraLock, portMAX_DELAY);
   char val[24];
   bool needRestart = false;
   framesize_t newFs = g_fs;
@@ -367,15 +400,17 @@ static esp_err_t setHandler(httpd_req_t *req) {
 
   if (getParam(req, "q", val, sizeof(val))) {
     newQ = atoi(val);
-    if (newQ < 0)  newQ = 0;
-    if (newQ > 63) newQ = 63;
-    needRestart = true;
+    if (newQ < 1) newQ = 1;
+    if (newQ > 100) newQ = 100;
   }
 
   if (needRestart) {
-    if (!startCamera(newFs, newQ)) startCamera(FRAMESIZE_QVGA, 12);
-    delay(250);
+    if (!startCamera(newFs, newQ)) {
+      newQ = 75;
+      startCamera(FRAMESIZE_QVGA, newQ);
+    }
   }
+  g_quality = newQ;
 
   sensor_t *s = esp_camera_sensor_get();
   if (s) {
@@ -448,6 +483,7 @@ static esp_err_t setHandler(httpd_req_t *req) {
            s ? s->status.awb : -1,
            s ? s->slv_addr : 0);
 
+  xSemaphoreGive(g_cameraLock);
   httpd_resp_set_type(req, "application/json");
   return httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
 }
@@ -504,15 +540,28 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
       btn = document.getElementById('btn'),
       btnSize = document.getElementById('btnSize');
 
-  var running = true, frames = 0, t0 = 0, fail = 0;
+  var running = true, frames = 0, t0 = 0, fail = 0, sequence = 0, objectUrl = null, loading = false, requestStarted = 0;
   var realFps = 0, realSize = '';
   var sizes  = ['qvga','cif','hvga','vga','svga'];
   var labels = ['320x240','400x296','480x320','640x480','800x600'];
   var si = 1;
 
   function next() {
-    if (!running) return;
-    img.src = '/snap?t=' + Date.now();
+    if (!running || loading) return;
+    loading = true;
+    requestStarted = Date.now();
+    fetch('/snap?after=' + sequence, {credentials:'include', cache:'no-store'})
+      .then(function(r) {
+        if (r.status === 204) { loading = false; setTimeout(next, 40); return null; }
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        sequence = Number(r.headers.get('X-Frame-Id')) || 0;
+        return r.blob();
+      }).then(function(blob) {
+        if (!blob) return;
+        if (objectUrl) URL.revokeObjectURL(objectUrl);
+        objectUrl = URL.createObjectURL(blob);
+        img.src = objectUrl;
+      }).catch(function() { img.onerror(); });
   }
 
   /* 每 2 秒问一次板子的真实帧率（页面拉取频率不代表画面更新频率） */
@@ -524,6 +573,7 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
   }, 2000);
 
   img.onload = function () {
+    loading = false;
     fail = 0; frames++;
     if (!t0) t0 = Date.now();
     var sec = (Date.now() - t0) / 1000;
@@ -538,10 +588,12 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
                            img.naturalWidth + ' x ' + img.naturalHeight;
       }
     }
-    setTimeout(next, 15);
+    var interval = realFps > 0 ? Math.max(40, 1000 / realFps) : 100;
+    setTimeout(next, Math.max(0, interval - (Date.now() - requestStarted)));
   };
 
   img.onerror = function () {
+    loading = false;
     fail++;
     dot.className = 'off';
     stat.textContent = fail > 4 ? '信号中断，重试中' : '重连中...';
@@ -601,6 +653,30 @@ static esp_err_t indexHandler(httpd_req_t *req) {
   return httpd_resp_send(req, INDEX_HTML, HTTPD_RESP_USE_STRLEN);
 }
 
+static esp_err_t motionHandler(httpd_req_t *req) {
+  if (!checkAuth(req)) { sendAuthRequired(req); return ESP_OK; }
+  char json[400];
+  motionEventsStatus(json, sizeof(json));
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+  return httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t eventPhotoHandler(httpd_req_t *req) {
+  if (!checkAuth(req)) { sendAuthRequired(req); return ESP_OK; }
+  uint8_t *jpeg = nullptr;
+  size_t len = 0;
+  if (!motionEventsCopy(&jpeg, &len)) {
+    httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "No event photo");
+    return ESP_OK;
+  }
+  httpd_resp_set_type(req, "image/jpeg");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+  esp_err_t result = httpd_resp_send(req, (const char *)jpeg, len);
+  free(jpeg);
+  return result;
+}
+
 /* ---------- 服务 ---------- */
 
 static void startServer() {
@@ -609,6 +685,7 @@ static void startServer() {
   cfg.max_uri_handlers = 8;
   cfg.stack_size       = 12288;
   cfg.lru_purge_enable = true;
+  cfg.core_id = 0;
 
   if (httpd_start(&g_server, &cfg) != ESP_OK) {
     Serial.println("[HTTP] 启动失败");
@@ -622,10 +699,18 @@ static void startServer() {
 
   httpd_register_uri_handler(g_server, &u1);
   httpd_register_uri_handler(g_server, &u2);
-  httpd_register_uri_handler(g_server, &u3);
+  httpd_uri_t u5 = { .uri = "/motion", .method = HTTP_GET, .handler = motionHandler, .user_ctx = NULL };
+  httpd_uri_t u6 = { .uri = "/motion/photo", .method = HTTP_GET, .handler = eventPhotoHandler, .user_ctx = NULL };
+  httpd_register_uri_handler(g_server, &u5);
+  httpd_register_uri_handler(g_server, &u6);
   httpd_register_uri_handler(g_server, &u4);
 
-  Serial.println("[HTTP] 端口 80");
+  // A long MJPEG handler must not block /set, /snap or the event photo.
+  cfg.server_port = 81;
+  cfg.ctrl_port += 1;
+  if (httpd_start(&g_streamServer, &cfg) == ESP_OK)
+    httpd_register_uri_handler(g_streamServer, &u3);
+  Serial.println("[HTTP] control=80 MJPEG=81");
 }
 
 static void connectWiFi() {
@@ -661,12 +746,20 @@ void setup() {
 
   /* JPEG 缓冲放 PSRAM，SVGA 也就几十 KB */
   g_jpgBuf = (uint8_t *)ps_malloc(256 * 1024);
-  if (!g_jpgBuf) {
+  g_encodeBuf = (uint8_t *)ps_malloc(JPEG_CAPACITY);
+  g_snapBuf = (uint8_t *)ps_malloc(JPEG_CAPACITY);
+  g_streamBuf = (uint8_t *)ps_malloc(JPEG_CAPACITY);
+  if (!g_jpgBuf || !g_encodeBuf || !g_snapBuf || !g_streamBuf) {
     Serial.println("PSRAM 分配失败！");
     delay(5000);
     ESP.restart();
   }
   g_bufLock = xSemaphoreCreateMutex();
+  g_cameraLock = xSemaphoreCreateMutex();
+  if (!g_bufLock || !g_cameraLock || !motionEventsBegin()) {
+    Serial.println("[SYS] module initialization failed");
+    delay(5000); ESP.restart(); return;
+  }
 
   if (!startCamera(g_fs, g_quality)) {
     Serial.println("摄像头失败，10 秒后重启");
@@ -675,7 +768,10 @@ void setup() {
   }
 
   /* 采集任务钉在 Core 1，HTTP 服务跑 Core 0，互不打扰 */
-  xTaskCreatePinnedToCore(camTask, "camTask", 16384, NULL, 4, NULL, 1);
+  if (xTaskCreatePinnedToCore(camTask, "camTask", 16384, NULL, 4, NULL, 1) != pdPASS) {
+    Serial.println("[SYS] camera task creation failed");
+    delay(5000); ESP.restart(); return;
+  }
 
   connectWiFi();
   startServer();

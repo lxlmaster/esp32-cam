@@ -4,6 +4,8 @@
 
 > 关键前提：这块板子的摄像头是 **GC2145**，**没有硬件 JPEG 编码器**，全靠 ESP32 用 CPU 软件压缩。这决定了整个架构，详见下文。
 
+当前版本新增了移动检测、事件抓拍与异步 Webhook 推送，并优化 JPEG 缓冲和预览轮询。算法接入、推送配置与实机验收见 [性能优化与移动抓拍](docs/性能优化与移动抓拍.md)。软件 JPEG 质量已修正为 **1–100（越大越清晰），默认 75**；下方性能数据是旧版历史实测，不代表修改后的性能。
+
 ---
 
 ## 硬件
@@ -93,7 +95,7 @@ CH340 驱动：Windows 需手动装 WCH 官方驱动（可从 `himalayanelixir/a
 
 ### 2. 改配置
 
-编辑 `firmware/esp32_cam_final/esp32_cam_final.ino` 第 42-45 行：
+编辑 `firmware/esp32_cam_final/esp32_cam_final.ino` 中的连接和认证配置：
 
 ```c
 const char *WIFI_SSID = "你的WiFi名";        // 必须是 2.4G，5G 连不上
@@ -136,14 +138,16 @@ arduino-cli compile --fqbn "esp32:esp32:esp32s3:FlashSize=8M,PSRAM=opi,Partition
 |---|---|
 | `GET /` | 播放页（拉模式，每帧请求一次 `/snap`） |
 | `GET /snap` | 单张 JPEG |
-| `GET /stream` | MJPEG 流（给 VLC 用，iOS Safari 不支持） |
+| `GET :81/stream` | MJPEG 流，地址 `http://<IP>:81/stream`（给 VLC 用） |
 | `GET /set` | 查看当前参数（返回 JSON） |
 | `GET /set?size=qvga\|cif\|hvga\|vga\|svga` | 切分辨率 |
-| `GET /set?q=10` | JPEG 质量 0-63 |
+| `GET /set?q=75` | 软件 JPEG 质量 1–100，越大越清晰，无需重启摄像头 |
 | `GET /set?rg=256&gg=256&bg=256` | 软件色彩增益（8.8 定点，256=1.0倍） |
 | `GET /set?cf=0` | 关/开色彩校正 |
 | `GET /set?vflip=1` / `?hmirror=1` | 上下翻转 / 左右镜像 |
 | `GET /set?reg=0x51&val=0x80&page=1` | 直接写传感器寄存器 |
+| `GET /motion` | 检测状态、抓拍数量与推送结果 |
+| `GET /motion/photo` | 最近一次检测抓拍，尚无事件时返回 404 |
 
 ---
 
