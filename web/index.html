@@ -73,7 +73,7 @@
    const sizeMap = {'320x240':'qvga','400x296':'cif','480x320':'hvga','640x480':'vga','800x600':'svga'};
    if (sizeMap[settings.size]) $('resolution').value = sizeMap[settings.size];
   }
-  $('resolution').disabled = !camera?.online || isDetector;
+  $('resolution').disabled = !camera?.online;
   $('pauseButton').disabled = !camera?.configured || isDetector;
   $('captureButton').disabled = !lastLiveBlob;
   text('pauseButton', paused ? '继续画面' : '暂停画面');

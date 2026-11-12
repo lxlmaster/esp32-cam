@@ -68,7 +68,7 @@ const char *AUTH_PASS = CAMERA_AUTH_PASSWORD;
 #define XCLK_FREQ       15000000
 
 /* ---------- 运行参数 ---------- */
-static framesize_t g_fs = CAMERA_ROLE == CAMERA_ROLE_DETECTOR ? FRAMESIZE_QVGA : FRAMESIZE_CIF;   /* 400x296：实测 124ms / 8fps，画质与流畅的平衡点 */
+static framesize_t g_fs = CAMERA_ROLE == CAMERA_ROLE_DETECTOR ? FRAMESIZE_VGA : FRAMESIZE_CIF;
 static int         g_quality = 75; // software JPEG: 1..100, higher = better
 static bool        g_inited  = false;
 

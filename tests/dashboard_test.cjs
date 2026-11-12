@@ -8,6 +8,7 @@ const html = fs.readFileSync(path.join(root, 'web/index.html'), 'utf8');
 const frame = '<svg xmlns="http://www.w3.org/2000/svg" width="800" height="600"><rect width="800" height="600" fill="#29312b"/><rect x="70" y="65" width="320" height="280" fill="#6f8172"/><path d="M230 65v280M70 205h320" stroke="#344137" stroke-width="12"/><rect x="460" y="250" width="260" height="180" rx="8" fill="#434f42"/><path d="M0 460h800v140H0z" fill="#343b31"/><text x="40" y="550" font-size="19" fill="#b9dca4" font-family="sans-serif">TEST FRAME / simulated camera</text></svg>';
 const motion = {enabled:true,events:3,last_uptime_ms:12000,last_score:28,photo_bytes:400,sent:3,failed:0};
 let online = true, frameRequests = 0, settingsChanges = 0;
+const resolutionRequests = [];
 const settings = {role:'stream',size:'400x296',quality:75,compress_ms:108,fps_x10:80};
 const cameras = () => [
  {id:'stream',name:'客厅 · 实时画面',role:'stream',configured:true,online,settings:{...settings}},
@@ -24,7 +25,12 @@ const event = {id:'a'.repeat(32),score:28,received_at:'2026-11-10T17:30:00Z'};
    if(url.pathname === '/') return route.fulfill({contentType:'text/html',body:html});
    if(url.pathname === '/api/state') return route.fulfill({json:{cameras:cameras(),events:[event]}});
    if(url.pathname.includes('/snap')) { frameRequests++; return route.fulfill({contentType:'image/svg+xml',headers:{'X-Frame-Id':String(frameRequests)},body:frame}); }
-   if(url.pathname.includes('/settings')) {settingsChanges++;settings.size='640x480';return route.fulfill({json:settings});}
+   if(url.pathname.includes('/settings')) {
+    settingsChanges++;
+    resolutionRequests.push({camera:url.pathname.split('/')[3],size:url.searchParams.get('size')});
+    const isDetector=url.pathname.includes('/detector/');
+    return route.fulfill({json:{...settings,role:isDetector?'detector':'stream',size:{qvga:'320x240',cif:'400x296',hvga:'480x320',vga:'640x480',svga:'800x600'}[url.searchParams.get('size')]}});
+   }
    if(url.pathname.includes('/api/events/')) return route.fulfill({contentType:'image/svg+xml',body:frame});
    return route.fulfill({status:404});
   });
@@ -44,10 +50,15 @@ const event = {id:'a'.repeat(32),score:28,received_at:'2026-11-10T17:30:00Z'};
   await page.locator('#resolution').selectOption('vga');
   await page.waitForFunction(()=>document.getElementById('toast').textContent==='分辨率已更新');
   assert.equal(settingsChanges,1);
+  assert.deepEqual(resolutionRequests[0],{camera:'stream',size:'vga'});
   await page.locator('.device').nth(1).click();
-  assert.equal(await page.locator('#resolution').isDisabled(),true);
+  assert.equal(await page.locator('#resolution').isDisabled(),false);
   assert.equal(await page.locator('#pauseButton').isDisabled(),true);
   assert.match(await page.locator('#viewMessage').textContent(),/检测设备/);
+  await page.locator('#resolution').selectOption('svga');
+  await page.waitForFunction(()=>document.getElementById('toast').textContent==='分辨率已更新');
+  assert.equal(settingsChanges,2);
+  assert.deepEqual(resolutionRequests[1],{camera:'detector',size:'svga'});
   await page.locator('.device').nth(0).click();
   await page.waitForFunction(()=>!document.getElementById('liveImage').classList.contains('hidden'));
   await fs.promises.mkdir(path.join(root,'.tools/screenshots'),{recursive:true});
